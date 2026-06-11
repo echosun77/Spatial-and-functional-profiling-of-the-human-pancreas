@@ -1,0 +1,105 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import tifffile
+from pathlib import Path
+from skimage.filters import threshold_otsu
+from sklearn.cluster import DBSCAN
+
+OUTPUT_DIR    = Path("/Users/alanamullins/Downloads/islet_analysis_output")
+PIXEL_UM      = 0.1235
+TIFF_PATH     = "/Users/alanamullins/Downloads/Experiment-5954_14-21-49.czi - Experiment-5954_14-21-49.czi #1.tif"
+DUCT_CLUSTERS = [16, 24, 39, 40, 17, 18, 5, 20]
+DS_VIZ        = 8
+
+# Load csvs
+cells       = pd.read_csv(OUTPUT_DIR / "all_cells_raw.csv")
+extra_final = pd.read_csv(OUTPUT_DIR / "validated_extraislet_cells_final.csv")
+
+# rebuild islet detection
+ins_thresh       = threshold_otsu(cells['insulin_mean'].values)
+cells['is_beta'] = cells['insulin_mean'] > ins_thresh
+beta             = cells[cells.is_beta].copy()
+coords           = beta[['y_fullres','x_fullres']].values
+db               = DBSCAN(eps=200, min_samples=10, n_jobs=-1)
+labels           = db.fit_predict(coords)
+beta['islet_cluster'] = labels
+beta['is_duct']       = beta['islet_cluster'].isin(DUCT_CLUSTERS)
+beta_clean            = beta[~beta['is_duct']].copy()
+
+#rebuild islet metrics
+cluster_stats = []
+for cl in sorted(set(labels)):
+    if cl < 0 or cl in DUCT_CLUSTERS:
+        continue
+    sub       = beta_clean[beta_clean['islet_cluster']==cl]
+    coords_cl = sub[['y_fullres','x_fullres']].values
+    cy, cx    = coords_cl[:,0].mean(), coords_cl[:,1].mean()
+    y_range   = coords_cl[:,0].max()-coords_cl[:,0].min()
+    x_range   = coords_cl[:,1].max()-coords_cl[:,1].min()
+    cluster_stats.append({
+        'cluster':     cl,
+        'centroid_y':  cy,
+        'centroid_x':  cx,
+        'diameter_um': max(y_range, x_range) * PIXEL_UM,
+    })
+valid_islets = pd.DataFrame(cluster_stats)
+print(f"Valid islets: {len(valid_islets)}")
+print(f"Extra-islet beta cells: {len(extra_final)}")
+
+# Load insulin channel only
+print("Loading insulin channel...")
+ins_full = tifffile.imread(TIFF_PATH)[2]
+ins_viz  = ins_full[::DS_VIZ, ::DS_VIZ].astype(np.float32)
+H_viz, W_viz = ins_viz.shape
+p2   = np.percentile(ins_viz[ins_viz>0], 2)
+p998 = np.percentile(ins_viz[ins_viz>0], 99.8)
+ins_norm = np.clip((ins_viz-p2)/(p998-p2+1e-8), 0, 1)
+
+#crop to tissue
+ins_crop       = ins_norm[226:3903, 0:5787]
+crop_h, crop_w = ins_crop.shape
+print(f"Ready — building figure...")
+
+# Figure no legend
+fig, ax = plt.subplots(figsize=(18, 7), facecolor='white')
+
+ax.imshow(ins_crop, cmap='Blues', vmin=0, vmax=1, aspect='equal')
+
+#islet circles
+for _, row in valid_islets.iterrows():
+    cy_i = row['centroid_y'] / DS_VIZ - 226
+    cx_i = row['centroid_x'] / DS_VIZ
+    r_i  = (row['diameter_um'] / 2) / (PIXEL_UM * DS_VIZ)
+    if cy_i > 0:
+        ax.add_patch(plt.Circle(
+            (cx_i, cy_i), r_i, color='#2ECC71',
+            fill=False, linewidth=1.5, alpha=0.9))
+
+# extra-islet beta cells
+ey   = extra_final['y_fullres'] / DS_VIZ - 226
+ex   = extra_final['x_fullres'] / DS_VIZ
+mask = ey > 0
+ax.scatter(ex[mask], ey[mask],
+           c='#E67E22', s=35, alpha=0.95,
+           linewidths=0.6, edgecolors='white', zorder=5)
+
+# Scale bar only — no legend
+sb_px = int(500 / (PIXEL_UM * DS_VIZ))
+ax.plot([crop_w-sb_px-40, crop_w-40],
+        [crop_h-20, crop_h-20], 'w-', linewidth=3)
+ax.text(crop_w-sb_px//2-40, crop_h-50,
+        '500 µm', color='white', ha='center',
+        fontsize=11, fontweight='bold', fontname='Arial')
+
+ax.set_xlim(0, crop_w)
+ax.set_ylim(crop_h, 0)
+ax.axis('off')
+
+fig.tight_layout(pad=0.5)
+out = OUTPUT_DIR / "FINAL_tissue_map_no_legend.png"
+fig.savefig(out, dpi=400, bbox_inches='tight',
+            facecolor='white', pad_inches=0.1)
+plt.show()
+print(f"Saved: {out}")

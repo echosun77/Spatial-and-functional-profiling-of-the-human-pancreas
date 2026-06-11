@@ -1,0 +1,722 @@
+
+# Imports 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.cm as cm
+import seaborn as sns
+import tifffile
+from pathlib import Path
+from scipy import stats
+from scipy.spatial.distance import cdist
+from scipy.stats import zscore
+from scipy.stats import t as t_dist
+from skimage.filters import threshold_otsu
+from sklearn.cluster import DBSCAN
+from statsmodels.stats.multitest import multipletests
+import statsmodels.formula.api as smf
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# Configuration — update paths before running
+TIFF_PATH  = "/path/to/your/image.tif"
+OUTPUT_DIR = Path("/path/to/output/")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+PIXEL_UM      = 0.1235   # um per pixel (20x LSM980)
+TILE_SIZE     = 4000     # pixels per tile
+OVERLAP       = 400      # tile overlap pixels
+CELL_DIAM     = 100      # Cellpose diameter (pixels)
+DS_VIZ        = 8        # downsample factor for visualisation
+
+# Manually identified duct clusters and outliers — update after inspection
+DUCT_CLUSTERS = [16, 24, 39, 40, 17, 18, 5, 20]
+
+
+# SECTION 1: IMAGE LOADIN
+
+def load_channels(tiff_path):
+    """
+    Load 4-channel TIFF image.
+    
+    Returns
+    -------
+    dict with keys: vdac1, mtco1, insulin, ecad, full
+    """
+    print("Loading image...")
+    data = tifffile.imread(tiff_path)
+    print(f"  Shape: {data.shape}")
+    return {
+        'vdac1':   data[0],
+        'mtco1':   data[1],
+        'insulin': data[2],
+        'ecad':    data[3],
+        'full':    data
+    }
+
+
+# SECTION 2: TILED CELLPOSE SEGMENTATION
+
+def norm_cp(arr):
+    """Normalise array to 0-255 uint8 using 1st-99.5th percentile."""
+    mask = arr > 0
+    if mask.sum() < 100:
+        return arr.astype(np.uint8)
+    lo = np.percentile(arr[mask], 1)
+    hi = np.percentile(arr[mask], 99.5)
+    return np.clip((arr-lo)/(hi-lo+1e-8)*255, 0, 255).astype(np.uint8)
+
+
+def get_tiles(H, W, tile_size, overlap):
+    """Generate tile coordinates covering full image."""
+    tiles = []
+    y = 0
+    while y < H:
+        x = 0
+        while x < W:
+            tiles.append((y, min(y+tile_size, H),
+                          x, min(x+tile_size, W)))
+            x += tile_size - overlap
+        y += tile_size - overlap
+    return tiles
+
+
+def run_tiled_segmentation(channels, output_dir):
+    """
+    Run Cellpose segmentation on full tissue using tiled pipeline.
+    
+    Parameters
+    ----------
+    channels : dict — output of load_channels()
+    output_dir : Path
+    
+    Returns
+    -------
+    cells : pd.DataFrame — per-cell measurements (76,628 cells)
+    
+    Notes
+    -----
+    - Model: cyto3
+    - Input: E-cadherin (primary) + Insulin (secondary)
+    - Tile size: 4000px, overlap: 400px, full resolution
+    - Runtime: ~34 minutes on Apple M4 Max (Metal GPU)
+    - Checkpoint saved every 10 tiles
+    """
+    from cellpose import models
+    from skimage.measure import regionprops_table
+    import time
+
+    ecad    = channels['ecad']
+    insulin = channels['insulin']
+    vdac1   = channels['vdac1']
+    mtco1   = channels['mtco1']
+    H, W    = ecad.shape
+    BORDER  = OVERLAP // 2
+
+    cell_model = models.CellposeModel(gpu=True, model_type='cyto3')
+    tiles      = get_tiles(H, W, TILE_SIZE, OVERLAP)
+    all_cells  = []
+    global_id  = 0
+    start      = time.time()
+
+    print(f"Segmenting {len(tiles)} tiles...")
+
+    for tile_idx, (y0, y1, x0, x1) in enumerate(tiles):
+        # Skip empty tiles
+        if (ecad[y0:y1:8, x0:x1:8] > 5).mean() < 0.03:
+            continue
+
+        e_t = ecad[y0:y1, x0:x1].astype(np.float32)
+        i_t = insulin[y0:y1, x0:x1].astype(np.float32)
+        v_t = vdac1[y0:y1, x0:x1].astype(np.float32)
+        m_t = mtco1[y0:y1, x0:x1].astype(np.float32)
+
+        try:
+            masks, _, _ = cell_model.eval(
+                np.stack([norm_cp(e_t), norm_cp(i_t)], axis=-1),
+                diameter=CELL_DIAM, channel_axis=2,
+                flow_threshold=0.8, cellprob_threshold=-1.0,
+                augment=True, do_3D=False)
+        except Exception as ex:
+            print(f"  Tile {tile_idx} error: {ex}")
+            continue
+
+        if masks.max() == 0:
+            continue
+
+        props = regionprops_table(
+            masks,
+            intensity_image=np.stack([e_t,i_t,v_t,m_t], axis=-1),
+            properties=['label','area','centroid','bbox',
+                        'intensity_mean','intensity_max'])
+        df = pd.DataFrame(props)
+        df.columns = [
+            c.replace('intensity_mean-0','ecad_mean')
+             .replace('intensity_mean-1','insulin_mean')
+             .replace('intensity_mean-2','vdac1_mean')
+             .replace('intensity_mean-3','mtco1_mean')
+             .replace('intensity_max-0','ecad_max')
+             .replace('intensity_max-1','insulin_max')
+             .replace('intensity_max-2','vdac1_max')
+             .replace('intensity_max-3','mtco1_max')
+            for c in df.columns]
+
+        th, tw = masks.shape
+        df = df[
+            (df['centroid-0'] > BORDER) &
+            (df['centroid-0'] < th-BORDER) &
+            (df['centroid-1'] > BORDER) &
+            (df['centroid-1'] < tw-BORDER)].copy()
+
+        df['y_fullres'] = df['centroid-0'] + y0
+        df['x_fullres'] = df['centroid-1'] + x0
+        df['cell_id']   = range(global_id, global_id+len(df))
+        df['tile_idx']  = tile_idx
+        global_id      += len(df)
+        all_cells.append(df)
+
+        elapsed   = (time.time()-start)/60
+        remaining = (elapsed/(tile_idx+1)) * (len(tiles)-tile_idx-1)
+        print(f"  [{tile_idx+1}/{len(tiles)}] {masks.max()} detected, "
+              f"{len(df)} kept | {elapsed:.0f}m | ~{remaining:.0f}m left")
+
+        if (tile_idx+1) % 10 == 0:
+            pd.concat(all_cells, ignore_index=True).to_csv(
+                output_dir/"cells_checkpoint.csv", index=False)
+
+    cells = pd.concat(all_cells, ignore_index=True)
+    cells.to_csv(output_dir/"all_cells_raw.csv", index=False)
+    print(f"Complete: {len(cells):,} cells in "
+          f"{(time.time()-start)/60:.0f} minutes")
+    return cells
+
+
+# SECTION 3: BETA CELL CLASSIFICATION
+
+def classify_beta_cells(cells):
+    """
+    Classify insulin-positive beta cells using Otsu threshold.
+    
+    Returns cells with is_beta column and threshold value.
+    Threshold: 14.90 AU (Otsu on insulin_mean distribution)
+    """
+    ins_thresh       = threshold_otsu(cells['insulin_mean'].values)
+    cells['is_beta'] = cells['insulin_mean'] > ins_thresh
+    print(f"Insulin threshold (Otsu): {ins_thresh:.2f}")
+    print(f"Beta cells: {cells.is_beta.sum():,} / {len(cells):,}")
+    return cells, ins_thresh
+
+# SECTION 4: ISLET DETECTION
+
+
+def detect_islets(cells, duct_clusters):
+    """
+    Detect islet clusters using DBSCAN on insulin-positive cells.
+    
+    Parameters
+    ----------
+    duct_clusters : list — cluster IDs to exclude as ducts/outliers
+    
+    Returns
+    -------
+    beta_clean : pd.DataFrame — beta cells with islet_cluster labels
+    valid_islets : pd.DataFrame — per-islet shape metrics
+    
+    Notes
+    -----
+    DBSCAN parameters:
+        eps=200px (~24.7um): max gap between adjacent islet beta cells
+        min_samples=10: minimum beta cells to define an islet
+    
+    Duct exclusion:
+        Clusters visually confirmed as ducts excluded based on
+        hollow ring morphology in E-cadherin and insulin channels.
+        Additionally, cluster 20 excluded as statistical outlier
+        (MTCO1/VDAC1 z-score > 3.0).
+    
+    Final: 43 valid islets after excluding 8 duct/outlier clusters
+    """
+    beta   = cells[cells.is_beta].copy()
+    coords = beta[['y_fullres','x_fullres']].values
+    db     = DBSCAN(eps=200, min_samples=10, n_jobs=-1)
+    labels = db.fit_predict(coords)
+    beta['islet_cluster'] = labels
+    beta['is_duct']       = beta['islet_cluster'].isin(duct_clusters)
+    beta_clean            = beta[~beta['is_duct']].copy()
+
+    cluster_stats = []
+    for cl in sorted(set(labels)):
+        if cl < 0 or cl in duct_clusters:
+            continue
+        sub       = beta_clean[beta_clean['islet_cluster']==cl]
+        coords_cl = sub[['y_fullres','x_fullres']].values
+        cy, cx    = coords_cl[:,0].mean(), coords_cl[:,1].mean()
+        y_range   = coords_cl[:,0].max()-coords_cl[:,0].min()
+        x_range   = coords_cl[:,1].max()-coords_cl[:,1].min()
+        dists     = np.sqrt((coords_cl[:,0]-cy)**2 +
+                            (coords_cl[:,1]-cx)**2)
+        cluster_stats.append({
+            'cluster':      cl,
+            'n_cells':      len(sub),
+            'centroid_y':   cy,
+            'centroid_x':   cx,
+            'diameter_um':  max(y_range,x_range)*PIXEL_UM,
+            'ring_score':   dists.std()/(dists.mean()+1e-8),
+            'mean_insulin': sub['insulin_mean'].mean()
+        })
+
+    valid_islets = pd.DataFrame(cluster_stats)
+    print(f"Valid islets: {len(valid_islets)}")
+    return beta_clean, valid_islets
+
+
+# SECTION 5: EXTRA-ISLET BETA CELL IDENTIFICATION
+
+def identify_extraislet_cells(beta_clean, islet_cells, valid_islets):
+    """
+    Identify validated extra-islet beta cells using multi-criteria filter.
+    
+    Criteria:
+        1. insulin_mean > 75th percentile of islet beta cells (27.9 AU)
+        2. Distance from nearest islet centroid > 150 um
+        3. Cell area within 10th-95th percentile of islet beta cells
+        4. Insulin contrast ratio (max/mean) > 4.0
+        5. Spatially isolated (no neighbour within 150px)
+    
+    Exclusions after manual validation:
+        - Cells below islet VDAC1 10th percentile (min mitochondrial mass)
+        - Confirmed Grubbs outliers (z-score > 2.7, alpha=0.05)
+        - Cells failing visual inspection across all 4 channels
+    
+    Final: 17 validated extra-islet beta cells
+    Density: 3.4 cells/mm2 (cf. 17.3 cells/mm2 Granlund et al. 2024)
+    
+    Returns
+    -------
+    extra_final : pd.DataFrame — validated extra-islet beta cells
+    """
+    # Compute thresholds from islet beta cells
+    ins_thresh  = np.percentile(islet_cells['insulin_mean'], 75)
+    size_min    = np.percentile(islet_cells['area'], 10)
+    size_max    = np.percentile(islet_cells['area'], 95)
+    vdac1_min   = np.percentile(islet_cells['vdac1_mean'], 10)
+
+    # Candidate extra-islet cells
+    extra = beta_clean[beta_clean['islet_cluster']==-1].copy()
+    extra['ins_contrast'] = (extra['insulin_max'] /
+                             (extra['insulin_mean']+1e-8))
+
+    # Distance to nearest islet
+    islet_centroids = valid_islets[['centroid_y','centroid_x']].values
+    dists = cdist(extra[['y_fullres','x_fullres']].values,
+                  islet_centroids).min(axis=1)
+    extra['min_dist_to_islet_um'] = dists * PIXEL_UM
+
+    # Apply quantitative filters
+    strict = extra[
+        (extra['insulin_mean']         > ins_thresh) &
+        (extra['min_dist_to_islet_um'] > 150) &
+        (extra['area']                 >= size_min) &
+        (extra['area']                 <= size_max) &
+        (extra['ins_contrast']         >= 4.0)
+    ].copy()
+
+    # Remove spatially grouped cells
+    db2    = DBSCAN(eps=150, min_samples=2, n_jobs=-1)
+    labels = db2.fit_predict(
+        strict[['y_fullres','x_fullres']].values)
+    strict = strict[labels==-1].copy()
+
+    # Remove low VDAC1 (below islet 10th percentile)
+    strict = strict[strict['vdac1_mean'] >= vdac1_min].copy()
+
+    # Grubbs test — remove ratio outliers
+    def grubbs_test(data, alpha=0.05):
+        n    = len(data)
+        G    = np.max(np.abs(data-data.mean())) / data.std(ddof=1)
+        t_c  = t_dist.ppf(1-alpha/(2*n), n-2)
+        G_c  = ((n-1)/np.sqrt(n))*np.sqrt(t_c**2/(n-2+t_c**2))
+        return G > G_c, np.argmax(np.abs(data-data.mean()))
+
+    strict['mtco1_norm'] = (strict['mtco1_mean'] /
+                             (strict['vdac1_mean']+1e-8))
+    is_outlier, out_idx = grubbs_test(strict['mtco1_norm'].values)
+    if is_outlier:
+        strict = strict.drop(
+            index=strict.index[out_idx]).reset_index(drop=True)
+        print(f"Grubbs outlier removed (MTCO1/VDAC1)")
+
+    strict['mtco1_norm'] = (strict['mtco1_mean'] /
+                             (strict['vdac1_mean']+1e-8))
+
+    print(f"Extra-islet beta cells: {len(strict)}")
+    print(f"Density: {len(strict)/5:.1f} cells/mm2")
+    return strict
+
+
+# SECTION 6: STATISTICAL ANALYSIS
+
+def run_lme_analysis(islet_cells, extra_final):
+    """
+    Linear mixed effects model comparing islet vs extra-islet beta cells.
+    
+    Model specification:
+        Fixed effect: cell_type (islet=0, extra-islet=1)
+        Random effect: islet identity (accounts for within-islet correlation)
+        Transformation: log1p for normality
+        Correction: Benjamini-Hochberg FDR across 3 markers
+    
+    Justification:
+        LME is preferred over Mann-Whitney U on per-islet means because
+        it uses all individual cell data while properly accounting for
+        the non-independence of cells within the same islet. This avoids
+        both pseudoreplication (individual cells treated as independent)
+        and variance reduction artefacts (per-islet averaging artificially
+        reduces within-group variance, inflating significance).
+    
+    Returns
+    -------
+    lme_results : dict — coefficients, p-values, CIs per marker
+    
+    Final results (n=2,096 islet cells, 43 islets vs n=17 extra-islet):
+        VDAC1:       exp(b)=3.19x, p_fdr=3.4e-39 ***
+        MTCO1/VDAC1: exp(b)=0.91x, p_fdr=0.019 *
+        Insulin:     exp(b)=1.52x, p_fdr=8.8e-10 ***
+    """
+    islet_lme = islet_cells[['vdac1_mean','mtco1_norm',
+                               'insulin_mean','islet_cluster']].copy()
+    islet_lme['cell_type'] = 0
+    islet_lme['group_id']  = islet_lme['islet_cluster'].astype(str)
+
+    extra_lme = extra_final[['vdac1_mean','mtco1_norm',
+                              'insulin_mean']].copy()
+    extra_lme['cell_type'] = 1
+    extra_lme['group_id']  = [f'extra_{i}'
+                               for i in range(len(extra_lme))]
+
+    lme_df = pd.concat([islet_lme, extra_lme], ignore_index=True)
+
+    pvals, names, results = [], [], {}
+
+    for marker, name in [
+        ('vdac1_mean',  'VDAC1'),
+        ('mtco1_norm',  'MTCO1/VDAC1 ratio'),
+        ('insulin_mean','Insulin'),
+    ]:
+        col = f'{marker}_log'
+        lme_df[col] = np.log1p(np.clip(lme_df[marker], 0, None))
+        md  = smf.mixedlm(f"{col} ~ cell_type",
+                           lme_df, groups=lme_df['group_id'])
+        mdf = md.fit(method='lbfgs', reml=True)
+        ci  = mdf.conf_int()
+        results[name] = {
+            'coef':   mdf.params['cell_type'],
+            'pval':   mdf.pvalues['cell_type'],
+            'ci_lo':  ci.loc['cell_type', 0],
+            'ci_hi':  ci.loc['cell_type', 1],
+        }
+        pvals.append(mdf.pvalues['cell_type'])
+        names.append(name)
+
+    _, pvals_fdr, _, _ = multipletests(pvals, method='fdr_bh')
+
+    print("\nLME Results (FDR corrected):")
+    for name, p_fdr in zip(names, pvals_fdr):
+        r   = results[name]
+        sig = ('***' if p_fdr<0.001 else '**' if p_fdr<0.01
+               else '*' if p_fdr<0.05 else 'ns')
+        results[name]['pval_fdr'] = p_fdr
+        results[name]['sig_fdr']  = sig
+        print(f"  {name:20s}: exp(b)={np.exp(r['coef']):.2f}x "
+              f"p_fdr={p_fdr:.2e} {sig}")
+
+    return results
+
+# SECTION 7: FIGURES
+
+def plot_tissue_map(ins_norm, valid_islets, extra_final,
+                    output_dir, ds_viz=8):
+    """
+    Tissue overview map with islet circles and extra-islet beta cell dots.
+    Green circles = detected islets (sized by diameter)
+    Orange dots   = validated extra-islet beta cells
+    """
+    ins_crop  = ins_norm[226:3903, 0:5787]
+    crop_h, crop_w = ins_crop.shape
+
+    fig, ax = plt.subplots(figsize=(18, 7), facecolor='white')
+    ax.imshow(ins_crop, cmap='Blues', vmin=0, vmax=1, aspect='equal')
+
+    for _, row in valid_islets.iterrows():
+        cy_i = row['centroid_y']/ds_viz - 226
+        cx_i = row['centroid_x']/ds_viz
+        r_i  = (row['diameter_um']/2)/(PIXEL_UM*ds_viz)
+        if cy_i > 0:
+            ax.add_patch(plt.Circle(
+                (cx_i, cy_i), r_i, color='#2ECC71',
+                fill=False, linewidth=1.5, alpha=0.9))
+
+    ey   = extra_final['y_fullres']/ds_viz - 226
+    ex   = extra_final['x_fullres']/ds_viz
+    mask = ey > 0
+    ax.scatter(ex[mask], ey[mask], c='#E67E22', s=35,
+               alpha=0.95, linewidths=0.6,
+               edgecolors='white', zorder=5)
+
+    sb_px = int(500/(PIXEL_UM*ds_viz))
+    ax.plot([crop_w-sb_px-40, crop_w-40],
+            [crop_h-20, crop_h-20], 'w-', linewidth=3)
+    ax.text(crop_w-sb_px//2-40, crop_h-50, '500 um',
+            color='white', ha='center', fontsize=11,
+            fontweight='bold', fontname='Arial')
+
+    ax.legend(handles=[
+        mpatches.Patch(facecolor='none', edgecolor='#2ECC71',
+                       linewidth=2,
+                       label=f'Islets (n={len(valid_islets)})'),
+        plt.Line2D([0],[0], marker='o', color='w',
+                   markerfacecolor='#E67E22', markersize=9,
+                   markeredgecolor='white', markeredgewidth=0.6,
+                   label=f'Extra-islet b-cells '
+                         f'(n={len(extra_final)})'),
+    ], loc='lower left', facecolor='black', edgecolor='none',
+       labelcolor='white', fontsize=10, framealpha=0.8,
+       prop={'family': 'Arial'})
+
+    ax.set_xlim(0, crop_w); ax.set_ylim(crop_h, 0)
+    ax.axis('off')
+    ax.set_title(
+        'Human pancreatic tissue — islet detection & '
+        'extra-islet b-cell mapping\\n'
+        'ND lean donor | LSM980 confocal 20x | '
+        'Insulin signal (AF405)',
+        color='black', fontsize=12, fontweight='bold',
+        fontname='Arial', pad=8)
+
+    fig.tight_layout(pad=0.5)
+    out = output_dir / "FINAL_tissue_map.png"
+    fig.savefig(out, dpi=400, bbox_inches='tight',
+                facecolor='white', pad_inches=0.1)
+    plt.show()
+    print(f"Saved: {out}")
+
+
+def plot_violin_lme(islet_cells, extra_final, lme_results,
+                    islet_means, unique_clusters,
+                    cluster_colours, output_dir):
+    """
+    Violin plots comparing VDAC1, MTCO1/VDAC1, and Insulin.
+    Individual islet cells coloured by islet identity.
+    Statistics from linear mixed effects model (FDR corrected).
+    """
+    fig, vax = plt.subplots(1, 3, figsize=(16, 6), facecolor='white')
+    plt.subplots_adjust(wspace=0.5)
+
+    DIAB_LIGHT = '#AAC4E2'
+    DIAB_DARK  = '#8AA9D6'
+    order      = ['Islet b', 'Extra-islet b']
+    palette    = {'Islet b': DIAB_LIGHT, 'Extra-islet b': DIAB_DARK}
+
+    y_limits = {
+        'vdac1_mean':   (0,   58),
+        'mtco1_norm':   (-0.1, 2.0),
+        'insulin_mean': (10,  78),
+    }
+
+    for idx, (marker, name, ylabel) in enumerate([
+        ('vdac1_mean',  'VDAC1',
+         'VDAC1 mean intensity\\nper cell (AU) [Mitochondrial mass]'),
+        ('mtco1_norm',  'MTCO1/VDAC1',
+         'MTCO1/VDAC1 ratio per cell\\n[Complex IV / Mitochondrial mass]'),
+        ('insulin_mean','Insulin',
+         'Insulin mean intensity\\nper cell (AU)'),
+    ]):
+        ax   = vax[idx]
+        iv   = islet_cells[marker].values
+        ev   = extra_final[marker].values
+        y_lo, y_hi = y_limits[marker]
+
+        plot_df = pd.DataFrame({
+            'value': np.concatenate([iv, ev]),
+            'Group': ['Islet b']*len(iv) +
+                     ['Extra-islet b']*len(ev)
+        })
+
+        sns.violinplot(data=plot_df, x='Group', y='value',
+                       hue='Group', palette=palette, ax=ax,
+                       inner=None, legend=False, order=order,
+                       linewidth=0.75, cut=0, bw_adjust=1.2)
+        sns.boxplot(data=plot_df, x='Group', y='value',
+                    order=order, ax=ax, width=0.09,
+                    boxprops=dict(facecolor='white',
+                                  edgecolor='black', linewidth=0.75),
+                    whiskerprops=dict(color='black', linewidth=0.75),
+                    capprops=dict(color='black', linewidth=0.75),
+                    medianprops=dict(color='black', linewidth=1.5),
+                    showfliers=False)
+
+        np.random.seed(42)
+        islet_plot = islet_cells.copy()
+        for cl in unique_clusters:
+            sub = islet_plot[islet_plot['islet_cluster']==cl]
+            col = cluster_colours.get(cl, 'gray')
+            ax.scatter(np.random.normal(0, 0.06, len(sub)),
+                       sub[marker].values,
+                       color=col, s=4, alpha=0.25,
+                       zorder=4, linewidths=0)
+
+        np.random.seed(42)
+        ax.scatter(np.random.normal(1, 0.06, len(ev)),
+                   ev, color=DIAB_DARK, s=40, alpha=0.9,
+                   zorder=5, linewidths=0.5,
+                   edgecolors='white')
+
+        lme_name = (name if name != 'MTCO1/VDAC1'
+                    else 'MTCO1/VDAC1 ratio')
+        r   = lme_results[lme_name]
+        p   = r['pval_fdr']
+        sig = r['sig_fdr']
+
+        y_bar = y_hi * 0.88
+        ax.plot([0,1],[y_bar,y_bar],'k-',linewidth=0.75)
+        ax.text(0.5, y_bar+(y_hi-y_lo)*0.02,
+                f'{sig}  p={p:.2e}\\n(LME, FDR)',
+                ha='center', va='bottom', color='black',
+                fontsize=8.5, fontname='Arial')
+
+        n_y = y_lo + (y_hi-y_lo)*0.02
+        ax.text(0, n_y,
+                f'n={len(iv):,} cells\\n({len(islet_means)} islets)',
+                ha='center', va='bottom', color='#555555',
+                fontsize=7.5, fontname='Arial', style='italic')
+        ax.text(1, n_y, f'n={len(ev)} cells',
+                ha='center', va='bottom', color='#555555',
+                fontsize=7.5, fontname='Arial', style='italic')
+
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_title(['a','b','c'][idx], color='black',
+                      fontsize=14, fontweight='bold',
+                      fontname='Arial', loc='left', pad=6)
+        ax.text(0.5, 1.01, name, color='black', fontsize=13,
+                 fontweight='bold', fontname='Arial',
+                 ha='center', transform=ax.transAxes)
+        ax.set_xlabel('')
+        ax.set_ylabel(ylabel, color='black', fontsize=9,
+                       fontname='Arial')
+        ax.set_facecolor('white')
+        ax.grid(False)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(0.75)
+        ax.spines['bottom'].set_linewidth(0.75)
+        ax.tick_params(colors='black', labelsize=9, width=0.75)
+        for lbl in ax.get_xticklabels()+ax.get_yticklabels():
+            lbl.set_fontname('Arial')
+
+    fig.suptitle(
+        'Mitochondrial protein expression: islet vs extra-islet b-cells\\n'
+        'LME, FDR corrected | n=2,096 islet cells (43 islets) '
+        'vs n=17 extra-islet cells',
+        color='black', fontsize=11, fontweight='bold',
+        fontname='Arial', y=1.02)
+
+    out = output_dir / "FINAL_violin.png"
+    fig.savefig(out, dpi=400, bbox_inches='tight',
+                facecolor='white', pad_inches=0.15)
+    plt.show()
+    print(f"Saved: {out}")
+
+
+# SECTION 8: MAIN PIPELINE
+
+def main():
+    print("="*60)
+    print("Pancreatic Islet Analysis Pipeline")
+    print("="*60)
+
+    # Load image
+    channels = load_channels(TIFF_PATH)
+
+    # 2. Segment (or load from checkpoint)
+    csv_path = OUTPUT_DIR / "all_cells_raw.csv"
+    if csv_path.exists():
+        print("Loading segmented cells from CSV...")
+        cells = pd.read_csv(csv_path)
+    else:
+        cells = run_tiled_segmentation(channels, OUTPUT_DIR)
+
+    # Classify beta cells
+    cells, ins_thresh = classify_beta_cells(cells)
+
+    # 4. Detect islets
+    beta_clean, valid_islets = detect_islets(cells, DUCT_CLUSTERS)
+
+    # Islet beta cells
+    islet_cells = beta_clean[
+        beta_clean['islet_cluster'] >= 0].copy()
+    islet_cells['mtco1_norm'] = (islet_cells['mtco1_mean'] /
+                                  (islet_cells['vdac1_mean']+1e-8))
+
+    # Extra-islet beta cells
+    validated_path = OUTPUT_DIR / "validated_extraislet_cells_final.csv"
+    if validated_path.exists():
+        extra_final = pd.read_csv(validated_path)
+        extra_final['mtco1_norm'] = (extra_final['mtco1_mean'] /
+                                      (extra_final['vdac1_mean']+1e-8))
+    else:
+        extra_final = identify_extraislet_cells(
+            beta_clean, islet_cells, valid_islets)
+        extra_final.to_csv(validated_path, index=False)
+
+    # Per-islet means
+    islet_means = islet_cells.groupby('islet_cluster').agg(
+        vdac1_mean   = ('vdac1_mean',  'mean'),
+        mtco1_norm   = ('mtco1_norm',  'mean'),
+        insulin_mean = ('insulin_mean','mean'),
+        n_cells      = ('y_fullres',   'count')
+    ).reset_index()
+
+    # Colour map
+    unique_clusters = sorted(islet_cells['islet_cluster'].unique())
+    cmap_islets     = cm.get_cmap('tab20', len(unique_clusters))
+    cluster_colours = {cl: cmap_islets(i % 20)
+                       for i, cl in enumerate(unique_clusters)}
+
+    # Statistical analysis
+    lme_results = run_lme_analysis(islet_cells, extra_final)
+
+    # Tissue map
+    ins_full = channels['insulin']
+    ins_viz  = ins_full[::DS_VIZ, ::DS_VIZ].astype(np.float32)
+    p2       = np.percentile(ins_viz[ins_viz>0], 2)
+    p998     = np.percentile(ins_viz[ins_viz>0], 99.8)
+    ins_norm = np.clip((ins_viz-p2)/(p998-p2+1e-8), 0, 1)
+    plot_tissue_map(ins_norm, valid_islets, extra_final, OUTPUT_DIR)
+
+    # 11. Violin plots
+    plot_violin_lme(islet_cells, extra_final, lme_results,
+                    islet_means, unique_clusters,
+                    cluster_colours, OUTPUT_DIR)
+
+    print("\\n" + "="*60)
+    print("Pipeline complete!")
+    print(f"  Valid islets:           {len(valid_islets)}")
+    print(f"  Islet beta cells:       {len(islet_cells):,}")
+    print(f"  Extra-islet beta cells: {len(extra_final)}")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# Save to file
+code_path = OUTPUT_DIR / "islet_analysis_pipeline.py"
+with open(code_path, 'w') as f:
+    f.write(full_code)
+print(f"Saved: {code_path}")
+print(f"Size: {code_path.stat().st_size/1024:.1f} KB")
+print("\nReady to upload to GitHub alongside README.md")
+print(f"  computational_methods.txt   — methods for paper")
