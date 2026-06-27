@@ -1,12 +1,9 @@
 # Spatial and functional mapping of the human pancreas reveals endocrine and exocrine cell states in health and metabolic disease
 
-## Author
-
-Yike Xie
 
 ## Overview
 
-This repository contains the custom scripts used for the analysis presented in the manuscript *Functional-spatial mapping of human pancreatic niches using Slice-seq*.
+This repository contains the custom scripts used for the analysis presented in the manuscript *Spatial and functional mapping of the human pancreas reveals endocrine and exocrine cell states in health and metabolic disease*.
 
 The repository includes workflows for:
 
